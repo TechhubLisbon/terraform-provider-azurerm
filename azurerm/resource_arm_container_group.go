@@ -148,16 +148,48 @@ func resourceArmContainerGroup() *schema.Resource {
 						},
 
 						"port": {
-							Type:         schema.TypeInt,
-							Optional:     true,
-							ForceNew:     true,
-							ValidateFunc: validation.IntBetween(1, 65535),
+							Type:          schema.TypeInt,
+							Optional:      true,
+							ForceNew:      true,
+							ConflictsWith: []string{"container.0.ports"},
+							Deprecated:    "Use `ports` instead.",
+							ValidateFunc:  validate.PortNumber,
+						},
+
+						"ports": {
+							Type:          schema.TypeList,
+							Optional:      true,
+							ForceNew:      true,
+							ConflictsWith: []string{"container.0.port", "container.0.protocol"},
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"protocol": {
+										Type:             schema.TypeString,
+										Optional:         true,
+										ForceNew:         true,
+										DiffSuppressFunc: ignoreCaseDiffSuppressFunc,
+										Default:          string(containerinstance.TCP),
+										ValidateFunc: validation.StringInSlice([]string{
+											"tcp",
+											"udp",
+										}, true),
+									},
+									"port": {
+										Type:         schema.TypeInt,
+										Required:     true,
+										ForceNew:     true,
+										ValidateFunc: validate.PortNumber,
+									},
+								},
+							},
 						},
 
 						"protocol": {
 							Type:             schema.TypeString,
 							Optional:         true,
 							ForceNew:         true,
+							ConflictsWith:    []string{"container.0.ports"},
+							Deprecated:       "Use `ports` instead.",
 							DiffSuppressFunc: ignoreCaseDiffSuppressFunc,
 							ValidateFunc: validation.StringInSlice([]string{
 								string(containerinstance.TCP),
@@ -436,6 +468,27 @@ func expandContainerGroupContainers(d *schema.ResourceData) (*[]containerinstanc
 			containerGroupPorts = append(containerGroupPorts, containerGroupPort)
 		}
 
+		if v, ok := data["ports"]; ok {
+			s := v.(*schema.Set)
+			var ports []containerinstance.ContainerPort
+			for _, v := range s.List() {
+				portObj := v.(map[string]interface{})
+				portI := portObj["port"]
+				port := int32(portI.(int))
+				protoI := portObj["protocol"]
+				proto := protoI.(string)
+				ports = append(ports, containerinstance.ContainerPort{
+					Protocol: containerinstance.ContainerNetworkProtocol(strings.ToUpper(proto)),
+					Port:     &port,
+				})
+				containerGroupPorts = append(containerGroupPorts, containerinstance.Port{
+					Protocol: containerinstance.ContainerGroupNetworkProtocol(strings.ToUpper(proto)),
+					Port:     &port,
+				})
+			}
+			container.Ports = &ports
+		}
+
 		// Set both sensitive and non-secure environment variables
 		var envVars *[]containerinstance.EnvironmentVariable
 		var secEnvVars *[]containerinstance.EnvironmentVariable
@@ -617,10 +670,13 @@ func flattenContainerGroupContainers(d *schema.ResourceData, containers *[]conta
 
 	//map old container names to index so we can look up things up
 	nameIndexMap := map[string]int{}
+	var newPortsField bool
 	for i, c := range d.Get("container").([]interface{}) {
 		cfg := c.(map[string]interface{})
 		nameIndexMap[cfg["name"].(string)] = i
-
+		if _, ok := cfg["ports"]; ok {
+			newPortsField = true
+		}
 	}
 
 	containerCfg := make([]interface{}, 0, len(*containers))
@@ -651,19 +707,30 @@ func flattenContainerGroupContainers(d *schema.ResourceData, containers *[]conta
 		}
 
 		if len(*container.Ports) > 0 {
-			containerPort := *(*container.Ports)[0].Port
-			containerConfig["port"] = containerPort
-			// protocol isn't returned in container config, have to search in container group ports
-			protocol := ""
-			if containerGroupPorts != nil {
-				for _, cgPort := range *containerGroupPorts {
-					if *cgPort.Port == containerPort {
-						protocol = string(cgPort.Protocol)
+			if newPortsField {
+				ports := make([]interface{}, 0)
+				for _, p := range *container.Ports {
+					port := make(map[string]interface{})
+					port["port"] = int(*p.Port)
+					port["protocol"] = string(p.Protocol)
+					ports = append(ports, port)
+				}
+				containerConfig["ports"] = ports
+			} else {
+				containerPort := *(*container.Ports)[0].Port
+				containerConfig["port"] = containerPort
+				// protocol isn't returned in container config, have to search in container group ports
+				protocol := ""
+				if containerGroupPorts != nil {
+					for _, cgPort := range *containerGroupPorts {
+						if *cgPort.Port == containerPort {
+							protocol = string(cgPort.Protocol)
+						}
 					}
 				}
-			}
-			if protocol != "" {
-				containerConfig["protocol"] = protocol
+				if protocol != "" {
+					containerConfig["protocol"] = protocol
+				}
 			}
 		}
 
